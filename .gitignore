@@ -12,3 +12,5 @@ build/
 dist/
 .pytest_cache/
 config.json
+raw-cc/
+logs-cc/

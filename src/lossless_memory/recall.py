@@ -62,6 +62,7 @@ LAST_MODE = []       # which path served this query: "time" / "L3" (time -> sema
 LAST_TIME_TOTAL = []
 LAST_TIME_META = []
 LAST_TAIL = []
+LAST_OMITTED = []    # rows dropped by a row cap (date-scope / --around / --compact), never silent
 
 
 def _note_error(part, ex):
@@ -163,15 +164,25 @@ def _vector_search(query, limit):
         return []
 
 
-def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exact_only=False):
+def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exact_only=False,
+          include_action=False):
     """The shared core of recall. Returns a deduped list of raw-row
     dicts. Not meant to be called directly by most users -- see
-    recall() below, which formats the result for display."""
+    recall() below, which formats the result for display.
+
+    type='action' rows (tool-call bodies -- 61% of stored rows, mostly
+    low-signal) are excluded unless include_action=True. index_exact
+    already applies this at the SQL level (so it doesn't crowd out real
+    hits within a LIMIT); this function re-applies it defensively to
+    every source (including index_vector, which this module doesn't
+    own and can't guarantee filters the same way) so the contract holds
+    regardless of where a row came from."""
     del LAST_ERRORS[:]
     del LAST_MODE[:]
     del LAST_TIME_TOTAL[:]
     del LAST_TIME_META[:]
     del LAST_TAIL[:]
+    del LAST_OMITTED[:]
     ses_hits, vec_hits = [], []
     real = _silence()
     try:
@@ -185,11 +196,13 @@ def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exa
             try:
                 _hits = max(log_limit, 8) if _kws else 2
                 ses_hits, _meta = index_exact.search_time(
-                    _dr, _tr, _kws, actor=actor, hits=_hits, around=int(around))
+                    _dr, _tr, _kws, actor=actor, hits=_hits, around=int(around),
+                    include_action=include_action)
                 ses_hits = list(ses_hits or [])
                 LAST_MODE.append("time")
                 LAST_TIME_TOTAL.append(int(_meta.get("total", 0)))
                 LAST_TIME_META.append(_meta)
+                LAST_OMITTED.append(int(_meta.get("omitted", 0)))
                 # If the date range turned up almost nothing, fall back
                 # to a semantic search across all time rather than
                 # concluding "nothing" too quickly.
@@ -204,10 +217,14 @@ def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exa
         if not _time_mode:
             try:
                 if around:
-                    ses_hits = list(index_exact.search_with_context(
-                        query, actor=actor, hits=max(log_limit, 4), around=int(around)) or [])
+                    _ctx, _ctx_omitted = index_exact.search_with_context(
+                        query, actor=actor, hits=max(log_limit, 4), around=int(around),
+                        include_action=include_action)
+                    ses_hits = list(_ctx or [])
+                    LAST_OMITTED.append(int(_ctx_omitted or 0))
                 else:
-                    ses_hits = list(index_exact.search(query, actor, limit=max(log_limit, 8)) or [])
+                    ses_hits = list(index_exact.search(
+                        query, actor, limit=max(log_limit, 8), include_action=include_action) or [])
             except Exception as ex:
                 _note_error("index_exact", ex)
             if not actor and not exact_only:
@@ -216,12 +233,17 @@ def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exa
                 if (not _ds0) or min(_ds0) > VEC_FAR_CUT_NORMAL:
                     for q in _expand_query(query):
                         try:
-                            ses_hits += list(index_exact.search(q, actor, limit=max(log_limit, 8)) or [])
+                            ses_hits += list(index_exact.search(
+                                q, actor, limit=max(log_limit, 8), include_action=include_action) or [])
                         except Exception as ex:
                             _note_error("index_exact", ex)
                         vec_hits += _vector_search(q, max(log_limit, 8))
     finally:
         sys.stdout = real
+
+    if not include_action:
+        ses_hits = [r for r in ses_hits if (r.get("type") or "text") != "action"]
+        vec_hits = [r for r in vec_hits if (r.get("type") or "text") != "action"]
 
     if _time_mode:
         uniq = _dedupe_rows(ses_hits)
@@ -246,11 +268,22 @@ ECHO_EXCLUDE_MIN = 15
 
 
 def _is_echo(query, text):
+    """Whether `text` looks like it's just repeating `query` back
+    verbatim. Used only for the AI's own very recent reply (see
+    ECHO_WINDOW_MINUTES / _drop below) -- there the length of the
+    overlap isn't what makes something "just an echo"; a short
+    identifier (e.g. an 8-char one like "cw-topic") repeated back is
+    exactly as much an echo as a long one. A hard length floor here
+    used to be the deciding factor and wrongly swallowed genuine hits
+    whose *content* (not an echo at all) happened to be a 10+ char
+    identifier (#106 point 3)."""
     try:
         q = re.sub(r"\s", "", query)
         t = re.sub(r"\s", "", text or "")
+        if not q:
+            return False
         if len(q) < 20:
-            return q in t and len(q) >= 10
+            return q in t
         step = 10
         for i in range(0, len(q) - 20 + 1, step):
             if q[i:i + 20] in t:
@@ -292,13 +325,22 @@ def _too_recent(ts):
         return False
 
 
-def _recent_48h(ts):
+def _recent_minutes(ts, minutes):
     try:
         d = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         now = datetime.datetime.now(d.tzinfo)
-        return (now - d).total_seconds() < 48 * 3600
+        return (now - d).total_seconds() < minutes * 60
     except Exception:
         return False
+
+
+# How far back a row still counts as "the AI still echoing the query
+# back" (see _is_echo / _drop). Provisional -- not yet tuned against
+# real sessions; the point of this window is just to be well past
+# ECHO_EXCLUDE_MIN (which already drops *anything* in the last 15
+# minutes regardless of actor/content) but not so wide that a genuine
+# older hit whose actor happens to be the AI gets swept up.
+ECHO_WINDOW_MINUTES = 60
 
 
 def _fuse(ses_hits, vec_hits, limit, recency=True, _fuse_query=""):
@@ -311,7 +353,13 @@ def _fuse(ses_hits, vec_hits, limit, recency=True, _fuse_query=""):
     def _drop(r):
         if _too_recent(r.get("ts")):
             return True
-        if _is_echo(_fuse_query, r.get("text")) and _recent_48h(r.get("ts")):
+        # Only the AI's *own* very recent reply can be "just echoing
+        # the query" -- a matching row from the user, or an older AI
+        # row, is a genuine memory, not an echo, regardless of its
+        # length (#106 point 3: length alone used to be the test, and
+        # dropped real hits like "feed-digest").
+        if (r.get("actor") == ACTOR_AI and _recent_minutes(r.get("ts"), ECHO_WINDOW_MINUTES)
+                and _is_echo(_fuse_query, r.get("text"))):
             return True
         return False
     ses_hits = [r for r in ses_hits if not _drop(r)]
@@ -374,15 +422,25 @@ def _tail_search(query, exclude_keys, limit=3):
     """Best-effort: catch a message so recent the index hasn't picked
     it up yet, by scanning the tail of the raw source files directly.
     Only runs for the "claude_code" ingest format, since it parses
-    that transcript shape specifically; a no-op otherwise."""
+    that transcript shape specifically; a no-op otherwise.
+
+    Matching requires *every* extracted keyword to be present (an AND,
+    same precision philosophy as index_exact's phrase/AND tiers), not
+    a fraction of them. The old "at least 1/3 of the words" bar meant
+    a single common short word (a bare "10", say) alone was enough to
+    surface *any* recent message containing it, unconditionally shown
+    ahead of the real, better-ranked results -- which is what made
+    "today's unrelated chatter" drown out an older real match
+    (#106 point 4). Keyword extraction is delegated to
+    index_exact._extract_keywords so filler/stopwords are excluded the
+    same way the main search does, instead of a separate, looser regex."""
     del LAST_TAIL[:]
     cfg = config()
     if cfg.get("ingest_format") != "claude_code" or not cfg.get("raw_log_dir"):
         return
     raw_dir = cfg["raw_log_dir"]
     try:
-        words = [w for w in re.findall(
-            r"[一-鿿]{2,}|[ぁ-ゖ]{3,}|[゠-ヿ]{2,}|[A-Za-z0-9]{2,}", query)][:12]
+        words = index_exact._extract_keywords(index_exact._strip_query(query))[:12]
         if not words:
             return
         files = sorted(glob.glob(os.path.join(raw_dir, "*.jsonl")),
@@ -417,7 +475,7 @@ def _tail_search(query, exclude_keys, limit=3):
                 if _is_meta_text(text):
                     continue
                 n_match = sum(1 for w in words if w in text)
-                if n_match >= max(1, len(words) // 3):
+                if n_match == len(words):
                     ts = o.get("timestamp") or ""
                     key = (ts[:16], text[:40])
                     if key in exclude_keys:
@@ -480,7 +538,7 @@ def _detect_session():
     return None
 
 
-def _compact_lines(session, n):
+def _compact_lines(session, n, include_action=False):
     lines = []
     if _qr is None:
         lines.append("query_rules is unavailable, so compaction boundaries can't be read.")
@@ -498,6 +556,7 @@ def _compact_lines(session, n):
     if start is None:
         lines.append("This session has %d compaction boundary(ies)." % end)
         return lines
+    omitted = 0
     try:
         s_dt = datetime.datetime.fromisoformat(str(start).replace("Z", "+00:00"))
         e_dt = datetime.datetime.fromisoformat(str(end).replace("Z", "+00:00"))
@@ -505,11 +564,18 @@ def _compact_lines(session, n):
             s_dt = s_dt.replace(tzinfo=datetime.timezone.utc)
         if e_dt.tzinfo is None:
             e_dt = e_dt.replace(tzinfo=datetime.timezone.utc)
-        rows, _meta = index_exact.search_time((s_dt, e_dt), None, [])
+        # --compact used to be an unbounded "everything since the
+        # boundary" pull -- search_time's own row cap (see
+        # DATE_SCOPE_ROW_CAP) now applies here too, since this is the
+        # same date-scoped-with-no-keywords path (#106 point 1).
+        rows, _meta = index_exact.search_time((s_dt, e_dt), None, [], include_action=include_action)
+        omitted = int(_meta.get("omitted", 0))
     except Exception as ex:
         _note_error("compact(search_time)", ex)
         rows = []
     lines.append("-- before compaction: %d row(s) [%s, %s) --" % (len(rows), _ts_jst(start), _ts_jst(end)))
+    if omitted:
+        lines.append("-- %d earlier row(s) omitted (oldest first) -- pass --action or narrow the range for more" % omitted)
     for h in rows:
         ts = _ts_jst(h.get("ts"))
         tag = _tag_for(h)
@@ -518,8 +584,18 @@ def _compact_lines(session, n):
     return lines
 
 
+# --full used to mean "no cap at all" on a row's character count. This
+# is the cap that replaces that -- provisional, like the other caps in
+# this module: not yet tuned against how long a genuinely-needed row
+# actually gets, just high enough that --full is still useful for the
+# common case (a long-but-not-huge message) without letting one giant
+# tool-output row make the response unbounded again.
+DEFAULT_CHAR_CAP = 300
+FULL_CHAR_CAP = 4000
+
+
 def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
-          compact_n=0, session=None):
+          compact_n=0, session=None, include_action=False):
     """The manual entry point. Calls fetch() and formats the result
     for display. Returns a list of display lines, [NOW] first."""
     del LAST_MODE[:]
@@ -527,7 +603,7 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
     lines = ["[NOW] " + now + " -- anchor on the current time before reading anything below."]
 
     if compact_n:
-        lines.extend(_compact_lines(session, compact_n))
+        lines.extend(_compact_lines(session, compact_n, include_action=include_action))
         return lines
 
     _dr, _tr, _kws = _split_time(query)
@@ -535,7 +611,8 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
         lines.append("A time-of-day alone can't narrow the range (searching all time). "
                      "Add a date to narrow it (e.g. \"2026-09-02 evening budget\").")
 
-    uniq = fetch(query, actor=actor, around=around, log_limit=limit, recency=recency)
+    uniq = fetch(query, actor=actor, around=around, log_limit=limit, recency=recency,
+                include_action=include_action)
     if "exact-only" in LAST_MODE:
         lines.append("Semantic search is unavailable right now; showing exact date/keyword matches only.")
 
@@ -547,15 +624,25 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
             lines.append("[%s] %s: %s" % (ts, h.get("actor", ""), text))
 
     if uniq:
+        char_cap = FULL_CHAR_CAP if full else DEFAULT_CHAR_CAP
         ordered = sorted(uniq, key=lambda r: (r.get("ts") or ""))
         texts_show = []
+        n_truncated = 0
         for h in ordered:
             t = (h.get("text") or "").replace("\n", " ")
-            if not full and len(t) > 300:
-                t = t[:300] + "..."
+            if len(t) > char_cap:
+                t = t[:char_cap] + "..."
+                n_truncated += 1
             texts_show.append(t)
         total_chars = sum(len(t) for t in texts_show)
-        cut_note = "" if full else " (truncated to 300 chars)"
+        # Only claim a truncation happened if one actually did -- the
+        # old note was unconditional ("(truncated to 300 chars)") even
+        # when every row was already under the cap, which is the kind
+        # of small mismatch #106's "verbatim, and say so if trimmed"
+        # criterion is about.
+        cut_note = " (%d row(s) truncated to %d chars)" % (n_truncated, char_cap) if n_truncated else ""
+
+        omitted = sum(LAST_OMITTED) if LAST_OMITTED else 0
 
         if "time" in LAST_MODE:
             meta0 = LAST_TIME_META[0] if LAST_TIME_META else {}
@@ -566,6 +653,9 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
             if _type_parts:
                 _head += " -- " + _type_parts
             lines.append(_head + " --")
+            if omitted:
+                lines.append("-- %d earlier row(s) omitted (oldest first, kept the most recent) -- "
+                             "narrow the range or add a keyword for the rest" % omitted)
             if meta0.get("level") == "L2":
                 lines.append("Few keyword matches, so showing the whole range chronologically instead.")
             if meta0.get("fallback_day"):
@@ -573,6 +663,8 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
         else:
             lines.append("-- %d row(s), ~%d chars%s (verbatim, timestamped, chronological) --"
                         % (len(ordered), total_chars, cut_note))
+            if omitted:
+                lines.append("-- %d row(s) omitted by --around's cap (oldest first) --" % omitted)
         if "L3" in LAST_MODE:
             lines.append("Nothing in that date range, so searching all time by meaning instead.")
 
@@ -603,15 +695,76 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
         if _dr is not None and _dr[0] > _now_utc:
             lines.append("That range is in the future -- there's nothing recorded yet.")
         else:
-            lines.append("Nothing on record in that range (the range itself resolved correctly). "
-                         "Try different wording or double-check the date.")
+            _total_in_range = LAST_TIME_TOTAL[0] if LAST_TIME_TOTAL else 0
+            if _total_in_range:
+                lines.append("Nothing matched the keyword(s), but the index has %d row(s) in that date range "
+                             "(not shown, or excluded because they're type=action -- pass --action to include those)."
+                             % _total_in_range)
+            else:
+                lines.append("Nothing on record in that range (the range itself resolved correctly). "
+                             "Try different wording or double-check the date.")
     if LAST_ERRORS:
         lines.append("Note: part of the search failed (the index may be mid-rebuild). Results below are incomplete:")
         for e in LAST_ERRORS:
             lines.append("  " + e)
-    if len(lines) == 1:
-        lines.append("No hits. Absence is reported as absence, never guessed around -- "
-                     "but try at least one more phrasing (a different name for the same thing) before concluding there's nothing.")
+    # "nothing was found" used to be detected as len(lines) == 1 (only
+    # the [NOW] line present), which silently broke the moment any
+    # other note got appended -- most commonly LAST_ERRORS' own
+    # index_vector(import) ModuleNotFoundError, which fires on *every*
+    # query whenever the optional sentence-transformers/sqlite-vec
+    # dependency isn't installed (the expected, supported state per
+    # #106's own setup instructions). That made point 5's diagnostic
+    # unreachable in exactly the environment it was written for.
+    # Check the actual "did anything get shown" condition instead.
+    if not uniq and not LAST_TAIL and "time" not in LAST_MODE:
+        # Absence should be told apart from "filtered out" *and* from
+        # "couldn't check": a raw, type-inclusive bigram count against
+        # the index tells whether this is truly nothing on record, or
+        # something's there but didn't survive ranking/recency/the
+        # type filter (#106 point 5; e.g. "feed-digest" used to report
+        # 0 here while the index had 5 -- all type=action, silently
+        # excluded by default).
+        #
+        # raw_hit_count() returns None (never 0) when the index itself
+        # couldn't be read (corrupt/locked/mid-rebuild). That must NOT
+        # be reported as "confirmed 0" -- #106 review point 2 found
+        # this module claiming "the index has 0 matches ... isn't just
+        # a filtering artifact" immediately after logging that the
+        # index read had actually failed. "Couldn't check" and
+        # "checked, found nothing" are different claims and must read
+        # differently here.
+        try:
+            _idx_all = index_exact.raw_hit_count(query, actor=actor, include_action=True)
+        except Exception:
+            _idx_all = None
+        if _idx_all is None:
+            lines.append("No hits above the relevance/recency cutoff, and the index itself couldn't be checked "
+                         "just now (see the error note above if one was logged) -- this is NOT confirmed absence, "
+                         "just unknown. Try again once the index is readable.")
+        elif _idx_all:
+            if include_action:
+                lines.append("No hits above the relevance/recency cutoff, but the index has %d loose match(es) "
+                             "for this text -- try --around or different wording." % _idx_all)
+            else:
+                try:
+                    _idx_visible = index_exact.raw_hit_count(query, actor=actor, include_action=False)
+                except Exception:
+                    _idx_visible = None
+                if _idx_visible == 0:
+                    lines.append("No hits: the index has %d loose match(es) for this text, but all of them are "
+                                 "type=action (tool-call bodies, excluded by default) -- pass --action to include them."
+                                 % _idx_all)
+                elif _idx_visible is None:
+                    lines.append("No hits above the relevance/recency cutoff; the index has %d loose match(es) "
+                                 "overall, but whether any of those are visible (non-action) couldn't be checked "
+                                 "just now -- try --around, different wording, or --action." % _idx_all)
+                else:
+                    lines.append("No hits above the relevance/recency cutoff, but the index has %d loose match(es) "
+                                 "for this text -- try --around or different wording." % _idx_all)
+        else:
+            lines.append("No hits. Absence is reported as absence, never guessed around -- "
+                         "but try at least one more phrasing (a different name for the same thing) before concluding there's nothing. "
+                         "The index was checked and has 0 matches for this text either, so this isn't just a filtering artifact.")
     return lines
 
 
@@ -635,7 +788,10 @@ def main():
             except ValueError:
                 around = 1
             around = max(0, around)
+    if around > index_exact.AROUND_MAX_N:
+        around = index_exact.AROUND_MAX_N
     full = "--full" in argv
+    include_action = "--action" in argv
     compact_n = 0
     for i, a in enumerate(argv):
         if a.startswith("--compact"):
@@ -654,7 +810,7 @@ def main():
             session = a.split("=", 1)[1]
 
     if compact_n:
-        for line in recall("", compact_n=compact_n, session=session):
+        for line in recall("", compact_n=compact_n, session=session, include_action=include_action):
             print(line)
         return
 
@@ -668,18 +824,23 @@ def main():
         print("  dates understood: an explicit YYYY-MM-DD / M/D, or the Japanese relative words")
         print("  (today/yesterday/N days ago/last week/...). English relative dates are not supported yet.")
         print("")
-        print("--around[=N]  = also show N rows before/after each hit (default 1, no cap)")
+        print("--around[=N]  = also show N rows before/after each hit (default 1, capped at %d; a cap is"
+              % index_exact.AROUND_MAX_N)
+        print("                always noted if it drops any rows, never silent)")
         print("--user        = only rows from the configured user_name")
         print("--ai          = only rows from the configured ai_name")
+        print("--action      = include type=action rows (tool-call bodies; excluded by default)")
         print("--all-time    = no recency decay (weigh old and new equally)")
-        print("--full        = don't truncate rows to 300 chars")
-        print("--compact[=N] = everything since the N-th-to-last compaction boundary (claude_code format only)")
+        print("--full        = don't truncate rows to %d chars (still capped at %d, not unbounded)"
+              % (DEFAULT_CHAR_CAP, FULL_CHAR_CAP))
+        print("--compact[=N] = everything since the N-th-to-last compaction boundary (claude_code format only,")
+        print("                row count capped like a date-scoped query; a drop is always noted)")
         print("--session=ID  = session id to use with --compact (default: auto-detected)")
         sys.exit(1)
 
     query = " ".join(args)
     lines = recall(query, recency=("--all-time" not in sys.argv),
-                   actor=actor, around=around, full=full)
+                   actor=actor, around=around, full=full, include_action=include_action)
     for line in lines:
         print(line)
 
