@@ -8,6 +8,11 @@
   "data_dir": "./logs",
   "raw_log_dir": "./raw",
   "ingest_format": "plain",
+  "raw_log_recursive": false,
+
+  "_comment_cw": "To ingest Claude Code transcripts (~/.claude/projects/<project-key>/<session>.jsonl) instead of a flat directory of plain logs, set: raw_log_dir=~/.claude/projects, ingest_format=claude_code, raw_log_recursive=true, cw_units_dir=~/claude-workspaces/units",
+  "cw_units_dir": null,
+  "stale_after_hours": 24,
 
   "wake_word": "good morning",
   "bridge_minutes": 30,
