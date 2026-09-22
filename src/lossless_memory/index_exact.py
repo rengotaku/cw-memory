@@ -245,6 +245,26 @@ def _bigram_query(text):
     return " OR ".join(f'"{g}"' for g in grams)
 
 
+def _bigram_phrase_query(text):
+    """A *quoted* FTS5 phrase built the same way the bigram column is
+    populated (see _bigram): the stored column is a space-joined
+    sequence of overlapping 2-char windows, so a quoted phrase built
+    from that same sequence only matches when the windows appear
+    *consecutively* -- which is exactly the condition for the original
+    (whitespace-stripped) text to appear as a literal substring.
+
+    This is a much stronger match than _bigram_query's OR-of-any-window
+    (which matches if any single 2-char fragment appears anywhere), and
+    is used as the first, most precise attempt before falling back to
+    the looser OR query. See "structured index" note in search()."""
+    if not text:
+        return ""
+    s = "".join(str(text).split())
+    if len(s) <= 1:
+        return f'"{s}"' if s else ""
+    return f'"{_bigram(s)}"'
+
+
 def _keyword_and_query(keywords):
     """Multiple keywords joined with AND, e.g. ["work", "sleepy"] ->
     ("work") AND ("sleepy")."""
@@ -601,10 +621,22 @@ def build_index(force=False):
         con.close()
 
 
-def _fetch_rows(con, match_query, actor, hard_limit):
+def _type_clause(include_action):
+    """type != 'meta' is always excluded (compaction boundaries / harness
+    noise, never a real message). type='action' (a tool call's own body)
+    is excluded too unless include_action is True -- it's 61% of stored
+    rows and, being high-volume/low-signal, otherwise crowds out real
+    messages both in FTS rank order and in the final row count."""
+    if include_action:
+        return "type != 'meta'"
+    return "type != 'meta' AND type != 'action'"
+
+
+def _fetch_rows(con, match_query, actor, hard_limit, include_action=False):
+    type_clause = _type_clause(include_action)
     if match_query:
         sql = ("SELECT rowid, ts, actor, role, type, text, model, session"
-               " FROM recall WHERE bigram MATCH ? AND type != 'meta'")
+               " FROM recall WHERE bigram MATCH ? AND " + type_clause)
         params = [match_query]
         if actor:
             sql += " AND actor = ?"
@@ -615,13 +647,11 @@ def _fetch_rows(con, match_query, actor, hard_limit):
         # no keyword (date/time-of-day only): take everything, newest
         # first, and let the time filter below narrow it down.
         sql = ("SELECT rowid, ts, actor, role, type, text, model, session"
-               " FROM recall")
+               " FROM recall WHERE " + type_clause)
         params = []
         if actor:
-            sql += " WHERE actor = ? AND type != 'meta'"
+            sql += " AND actor = ?"
             params.append(actor)
-        else:
-            sql += " WHERE type != 'meta'"
         sql += " ORDER BY ts DESC LIMIT ?"
         params.append(int(hard_limit))
     return [dict(r) for r in con.execute(sql, params)]
@@ -640,33 +670,68 @@ def _apply_time_filters(rows, date_range, time_jst):
     return out
 
 
-def _fetch_day(con, date_range, time_jst, actor, limit):
+def _fetch_day(con, date_range, time_jst, actor, limit, include_action=False):
     """Date mode: return the whole day (or time-of-day window within
     it) in chronological order, for a "what did we talk about on day
     X" query -- the whole flow, not a scattering of fragments. If too
     many rows match, keep the most recent `limit` (chronological order
-    is preserved)."""
-    sql = "SELECT ts, actor, role, type, text, model, session FROM recall"
+    is preserved). Returns (rows, omitted_count)."""
+    sql = "SELECT ts, actor, role, type, text, model, session FROM recall WHERE " + _type_clause(include_action)
     params = []
     if actor:
-        sql += " WHERE actor = ? AND type != 'meta'"
+        sql += " AND actor = ?"
         params.append(actor)
-    else:
-        sql += " WHERE type != 'meta'"
     sql += " ORDER BY ts ASC"
     rows = [dict(r) for r in con.execute(sql, params)]
     rows = _apply_time_filters(rows, date_range, time_jst)
+    omitted = 0
     if len(rows) > limit:
+        omitted = len(rows) - limit
         rows = rows[-limit:]
-    return rows
+    return rows, omitted
 
 
-def search(keyword, actor=None, limit=5):
+def search(keyword, actor=None, limit=5, include_action=False):
     """Search by keyword and/or date and/or time-of-day, newest first.
     All three are optional and combine freely -- with nothing at all
     it just returns the most recent rows. Returns a list of raw-row
     dicts (the 7 core fields). Builds the index automatically if it
-    doesn't exist yet."""
+    doesn't exist yet.
+
+    Two precise tiers are tried first and *merged* (not early-returned
+    from individually -- see _MERGE note below); two looser tiers are
+    each tried in turn only if that merge found nothing:
+      1. a literal-substring phrase match (_bigram_phrase_query) --
+         the "structured" half of "full-text + structure" (#106): the
+         bigram column is a sequence, so a quoted phrase built the same
+         way requires the windows to appear *consecutively*, which is
+         equivalent to the original text appearing verbatim
+      2. an AND of each extracted keyword's own bigram match (already
+         fairly precise when 2+ keywords are found) -- also catches a
+         row where the same words appear in a different order, or with
+         other words between them, which the phrase tier cannot match
+         by construction and which is the ordinary case in Japanese
+         (word order isn't fixed the way it is in English)
+      3. an OR of every bigram in the cleaned query (loosest -- may
+         match on any 2-char fragment shared with unrelated text)
+      4. no filter at all (most recent rows)
+    type='action' rows (tool-call bodies) are excluded unless
+    include_action=True.
+
+    _MERGE (#106 review point 1): tier 1 used to return immediately on
+    any hit, without ever trying tier 2 -- so a query whose words
+    happen to appear contiguously *somewhere*, even in an unimportant
+    row, would silently hide a more relevant row where the same words
+    appear out of order or with something between them (real repro:
+    "topic 注入 打ち切り" returned only a minor correction-note aside
+    once the phrase tier matched it, burying the actual "注入打ち切り"
+    status row that the AND tier alone finds top-ranked). Tiers 1 and
+    2 are now always merged whenever either finds anything -- phrase
+    hits first (stronger evidence: the exact text appears verbatim),
+    AND hits as a supplement below, deduplicated -- rather than
+    switching behavior based on how many phrase hits there happen to
+    be, which would make the result set change discontinuously across
+    similar queries."""
     if not os.path.exists(_index_db()):
         build_index()
 
@@ -682,17 +747,32 @@ def search(keyword, actor=None, limit=5):
         hard_limit = int(limit) * 8 + 20
 
         def _run(match_query):
-            rows = _fetch_rows(con, match_query, actor, hard_limit)
+            rows = _fetch_rows(con, match_query, actor, hard_limit, include_action=include_action)
             rows = _apply_time_filters(rows, date_range, time_jst)
             rows.sort(key=lambda r: _is_negative(r.get("text", "")))  # negatives last (stable sort)
             for r in rows:
                 r.pop("rowid", None)
             return rows[:int(limit)]
 
-        if len(keywords) >= 2:
-            rows = _run(_keyword_and_query(keywords))
-            if rows:
-                return rows
+        def _row_key(r):
+            return (r.get("ts"), r.get("actor"), r.get("text"), r.get("type"))
+
+        phrase_rows = _run(_bigram_phrase_query(cleaned)) if cleaned.strip() else []
+        and_rows = _run(_keyword_and_query(keywords)) if len(keywords) >= 2 else []
+        if phrase_rows or and_rows:
+            seen = set()
+            merged = []
+            for r in phrase_rows + and_rows:
+                k = _row_key(r)
+                if k in seen:
+                    continue
+                seen.add(k)
+                merged.append(r)
+                if len(merged) >= int(limit):
+                    break
+            if merged:
+                return merged
+
         if cleaned.strip():
             rows = _run(_bigram_query(cleaned))
             if rows:
@@ -702,10 +782,75 @@ def search(keyword, actor=None, limit=5):
         con.close()
 
 
-def search_with_context(keyword, actor=None, hits=2, around=1, day_limit=40):
+def raw_hit_count(keyword, actor=None, include_action=True):
+    """Diagnostic-only: how many rows match this query by the same
+    tiered strategy search() uses (phrase, then AND-of-keywords, then
+    OR-of-every-bigram -- see search()'s docstring), ignoring date/time
+    scoping and any relevance/recency cutoff. Stops at the first tier
+    that finds anything, same as search() does, rather than always
+    using the loosest tier -- an OR-of-bigrams count alone is so loose
+    it's rarely truly 0 for any real corpus, which would defeat the
+    point of this function (telling "genuinely nothing on record"
+    apart from "something's there but got filtered/ranked out",
+    #106 point 5, e.g. when every match is type=action and the caller
+    didn't ask to include it).
+
+    Returns None -- never 0 -- if the index couldn't actually be read
+    (corrupt file, mid-rebuild, locked, ...). 0 and "couldn't tell"
+    used to be collapsed together here, which let a broken index be
+    reported as confirmed proof of absence (#106 review point 2: a
+    corrupt-index repro produced "index has 0 matches ... isn't just a
+    filtering artifact" -- a false claim, since the index was never
+    actually read). Callers must not treat None as 0."""
+    try:
+        if not os.path.exists(_index_db()):
+            build_index()
+        con = sqlite3.connect(_index_db())
+        try:
+            cleaned = _strip_query(keyword)
+            if not cleaned.strip():
+                return 0
+            keywords = _extract_keywords(cleaned)
+
+            def _count(match_query):
+                if not match_query:
+                    return 0
+                sql = "SELECT count(*) FROM recall WHERE bigram MATCH ? AND " + _type_clause(include_action)
+                params = [match_query]
+                if actor:
+                    sql += " AND actor = ?"
+                    params.append(actor)
+                return con.execute(sql, params).fetchone()[0]
+
+            for mq in (_bigram_phrase_query(cleaned),
+                       _keyword_and_query(keywords) if len(keywords) >= 2 else None,
+                       _bigram_query(cleaned)):
+                if not mq:
+                    continue
+                n = _count(mq)
+                if n:
+                    return n
+            return 0
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        return None
+
+
+# --around's help text used to advertise "no cap" -- these are the caps
+# that replace that. Provisional: nobody has yet measured how many
+# rows/queries a session actually needs, so these are a first guess
+# to close the "returns literally everything" hole, not a tuned value.
+AROUND_MAX_N = 20        # clamp on the N in --around=N itself
+AROUND_ROW_CAP = 120     # clamp on the total row count a context pull returns
+
+
+def search_with_context(keyword, actor=None, hits=2, around=1, day_limit=40, include_action=False):
     """Like search(), but also returns `around` rows before and after
     each hit, from the same session, in chronological order with no
-    duplicates."""
+    duplicates. Returns (rows, omitted_count) -- omitted_count is the
+    number of rows dropped by AROUND_ROW_CAP / day_limit, never silent."""
+    around = max(0, min(int(around), AROUND_MAX_N))
     if not os.path.exists(_index_db()):
         build_index()
     con = sqlite3.connect(_index_db())
@@ -720,24 +865,37 @@ def search_with_context(keyword, actor=None, hits=2, around=1, day_limit=40):
         # July 4th") means "show me the whole day", not "find a
         # fragment" -- use _fetch_day instead of a hit + context pull.
         if date_range is not None and not keywords:
-            return _fetch_day(con, date_range, time_jst, actor, day_limit)
+            return _fetch_day(con, date_range, time_jst, actor, day_limit, include_action=include_action)
 
         hard_limit = int(hits) * 8 + 20
 
         def _candidates(match_query):
-            rows = _fetch_rows(con, match_query, actor, hard_limit)
+            rows = _fetch_rows(con, match_query, actor, hard_limit, include_action=include_action)
             rows = _apply_time_filters(rows, date_range, time_jst)
             return rows
 
+        # Same merge as search() (#106 review point 1): a phrase hit
+        # and an AND-of-keywords hit are combined, not early-returned
+        # from individually, so a relevant row whose words appear out
+        # of order (or with something between them) isn't hidden just
+        # because some other row happens to contain the query as a
+        # contiguous substring.
+        phrase_cand = _candidates(_bigram_phrase_query(cleaned)) if cleaned.strip() else []
+        and_cand = _candidates(_keyword_and_query(keywords)) if len(keywords) >= 2 else []
         cand = []
-        if len(keywords) >= 2:
-            cand = _candidates(_keyword_and_query(keywords))
+        if phrase_cand or and_cand:
+            seen_rowids = set()
+            for r in phrase_cand + and_cand:
+                if r["rowid"] in seen_rowids:
+                    continue
+                seen_rowids.add(r["rowid"])
+                cand.append(r)
         if not cand and cleaned.strip():
             cand = _candidates(_bigram_query(cleaned))
         if not cand:
             cand = _candidates("")
         if not cand:
-            return []
+            return [], 0
 
         cand.sort(key=lambda r: _is_negative(r.get("text", "")))
         hit_sel = cand[:int(hits)]
@@ -753,7 +911,14 @@ def search_with_context(keyword, actor=None, hits=2, around=1, day_limit=40):
                 if i >= 1 and rowid_session.get(i) == sess:
                     wanted.add(i)
         if not wanted:
-            return []
+            return [], 0
+        omitted = 0
+        if len(wanted) > AROUND_ROW_CAP:
+            # keep the highest rowids (== most recent rows) -- same
+            # "trim the oldest, say so" rule as the date-scoped cap.
+            kept = sorted(wanted, reverse=True)[:AROUND_ROW_CAP]
+            omitted = len(wanted) - len(kept)
+            wanted = set(kept)
         placeholders = ",".join("?" * len(wanted))
         rows = con.execute(
             "SELECT rowid, ts, actor, role, type, text, model, session"
@@ -771,7 +936,7 @@ def search_with_context(keyword, actor=None, hits=2, around=1, day_limit=40):
         # it to the context rows too.
         if date_range is not None or time_jst is not None:
             result = _apply_time_filters(result, date_range, time_jst)
-        return result
+        return result, omitted
     finally:
         con.close()
 
@@ -840,8 +1005,18 @@ def _latest_day_with_hours(time_jst):
         con.close()
 
 
+# Date-scoped mode (and --compact, which is date-scoped under the hood)
+# used to return literally every row in range -- 64,165 bytes / 166
+# rows for one real query. This is the cap that replaces "everything".
+# Provisional, same caveat as AROUND_MAX_N above: not yet tuned against
+# how many rows a session actually needs; the oldest rows in range are
+# dropped first and the drop count is always reported (never silent).
+DATE_SCOPE_ROW_CAP = 60
+
+
 def search_time(date_range, time_jst, keywords, actor=None,
-                hits=8, around=0, day_limit=40):
+                hits=8, around=0, day_limit=40, include_action=False,
+                row_cap=DATE_SCOPE_ROW_CAP):
     """The formal entry point for time-scoped search: takes an
     already-parsed (date_range, time_jst, keywords) -- typically from
     _split_time_query -- and returns only what's inside that range.
@@ -853,9 +1028,13 @@ def search_time(date_range, time_jst, keywords, actor=None,
     (row count after keyword filtering, or None in date-only mode),
     days (per-day counts), types (per-type counts), level ("L1" =
     keyword filter applied and kept, "L2" = keyword filter dropped
-    for being too narrow), and fallback_day (set when no date was
-    given and a time-of-day fell back to the most recent matching
-    day)."""
+    for being too narrow), fallback_day (set when no date was given
+    and a time-of-day fell back to the most recent matching day), and
+    omitted (how many in-range rows were dropped by row_cap -- the
+    oldest ones, always counted, never silently truncated).
+
+    type='action' rows are excluded unless include_action=True."""
+    around = max(0, min(int(around), AROUND_MAX_N))
     fallback_day = None
     if date_range is None and time_jst is not None:
         date_range = _latest_day_with_hours(time_jst)
@@ -863,7 +1042,7 @@ def search_time(date_range, time_jst, keywords, actor=None,
             fallback_day = date_range[0].astimezone(_JST).strftime("%Y-%m-%d")
     if date_range is None:
         return [], {"total": 0, "kw_total": None, "days": {}, "types": {},
-                     "level": None, "fallback_day": fallback_day}
+                     "level": None, "fallback_day": fallback_day, "omitted": 0}
     if not os.path.exists(_index_db()):
         build_index()
     con = sqlite3.connect(_index_db())
@@ -875,8 +1054,10 @@ def search_time(date_range, time_jst, keywords, actor=None,
         # the log grew large.
         _lo = (date_range[0] - timedelta(seconds=1)).isoformat()
         _hi = (date_range[1] + timedelta(seconds=1)).isoformat()
+        _type_extra = "" if include_action else " AND type != 'action'"
         _sql = ("SELECT rowid, ts, actor, role, type, text, model, session"
-                " FROM recall WHERE ts >= ? AND ts <= ? AND type != 'meta' AND type != 'doc'")
+                " FROM recall WHERE ts >= ? AND ts <= ? AND type != 'meta' AND type != 'doc'"
+                + _type_extra)
         _params = [_lo, _hi]
         if actor:
             _sql += " AND actor = ?"
@@ -901,10 +1082,19 @@ def search_time(date_range, time_jst, keywords, actor=None,
                 d[k] = d.get(k, 0) + 1
             return d
 
+        def _cap(rows_chrono_asc, cap):
+            """Keep the most recent `cap` rows of an ascending-by-ts
+            list; return (kept, omitted_count)."""
+            if len(rows_chrono_asc) <= cap:
+                return rows_chrono_asc, 0
+            return rows_chrono_asc[-cap:], len(rows_chrono_asc) - cap
+
         if not keywords:
             rows = sorted(in_range, key=lambda r: (r.get("ts") or ""))
+            rows, omitted = _cap(rows, row_cap)
             meta = {"total": total, "kw_total": None, "days": _day_counts(in_range),
-                    "types": _type_counts(in_range), "level": None, "fallback_day": fallback_day}
+                    "types": _type_counts(in_range), "level": None,
+                    "fallback_day": fallback_day, "omitted": omitted}
             for r in rows:
                 r.pop("rowid", None)
             return rows, meta
@@ -921,12 +1111,16 @@ def search_time(date_range, time_jst, keywords, actor=None,
             level = "L2"
         if not cand:
             return [], {"total": total, "kw_total": 0, "days": {}, "types": {},
-                         "level": level, "fallback_day": fallback_day}
+                         "level": level, "fallback_day": fallback_day, "omitted": 0}
 
+        cand_kw_total = len(cand)
+        cand_chrono = sorted(cand, key=lambda r: (r.get("ts") or ""))
+        cand_chrono, omitted = _cap(cand_chrono, row_cap)
+        cand = cand_chrono
         cand.sort(key=lambda r: _is_negative(r.get("text", "")))
         hit_sel = cand
 
-        if int(around) > 0:
+        if around > 0:
             rowid_session = {r["rowid"]: r["session"]
                              for r in con.execute("SELECT rowid, session FROM recall")}
             wanted = set()
@@ -934,9 +1128,13 @@ def search_time(date_range, time_jst, keywords, actor=None,
                 rid = h["rowid"]
                 sess = h.get("session")
                 wanted.add(rid)
-                for i in range(rid - int(around), rid + int(around) + 1):
+                for i in range(rid - around, rid + around + 1):
                     if i >= 1 and rowid_session.get(i) == sess:
                         wanted.add(i)
+            if len(wanted) > AROUND_ROW_CAP:
+                kept = sorted(wanted, reverse=True)[:AROUND_ROW_CAP]
+                omitted += len(wanted) - len(kept)
+                wanted = set(kept)
             placeholders = ",".join("?" * len(wanted))
             rows = [dict(r) for r in con.execute(
                 "SELECT rowid, ts, actor, role, type, text, model, session"
@@ -947,8 +1145,9 @@ def search_time(date_range, time_jst, keywords, actor=None,
             rows = hit_sel
 
         rows = sorted(rows, key=lambda r: (r.get("ts") or ""))
-        meta = {"total": total, "kw_total": len(cand), "days": _day_counts(cand),
-                "types": _type_counts(cand), "level": level, "fallback_day": fallback_day}
+        meta = {"total": total, "kw_total": cand_kw_total, "days": _day_counts(cand),
+                "types": _type_counts(cand), "level": level, "fallback_day": fallback_day,
+                "omitted": omitted}
         for r in rows:
             r.pop("rowid", None)
         return rows, meta
@@ -973,5 +1172,5 @@ if __name__ == "__main__":
         print(f"search '{kw}' -> {len(hits)} hit(s)")
 
     print("\n--- with context ---")
-    ctx = search_with_context("memory", hits=1, around=1)
-    print(f"hit + context -> {len(ctx)} row(s)")
+    ctx, ctx_omitted = search_with_context("memory", hits=1, around=1)
+    print(f"hit + context -> {len(ctx)} row(s), {ctx_omitted} omitted")
