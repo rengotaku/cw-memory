@@ -28,6 +28,20 @@ _DEFAULTS = {
     "raw_log_dir": None,
     # which ingest.py parser to use: "plain" or "claude_code"
     "ingest_format": "plain",
+    # walk raw_log_dir recursively for *.jsonl instead of a flat glob --
+    # Claude Code writes transcripts two levels deep (<raw_log_dir>/
+    # <project-key>/<session>.jsonl), so this must be true to read them
+    "raw_log_recursive": False,
+
+    # root directory cw units live under (e.g. "~/claude-workspaces/units").
+    # When set, ingest.py recovers the cw unit name (e.g. "2026-09-22_160959")
+    # a "claude_code" transcript belongs to from its project-key directory
+    # name, and stamps every converted row with a "unit" field. None
+    # disables unit recovery (every row's "unit" field is null).
+    "cw_units_dir": None,
+    # how many hours ingest is allowed to go without a successful run
+    # before --check-stale reports it as stopped
+    "stale_after_hours": 24,
 
     # LLL (state_index) tuning
     "wake_word": "good morning",   # greeting that resets the "current topic" window

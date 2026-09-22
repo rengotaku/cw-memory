@@ -109,6 +109,61 @@ Then follow [`examples/quickstart.md`](examples/quickstart.md): it ingests a sma
 
 ---
 
+## Ingesting Claude Code transcripts
+
+Claude Code writes one JSONL file per session under
+`~/.claude/projects/<project-key>/<session-uuid>.jsonl` (plus subagent
+transcripts one level deeper still) -- a two-level layout, not the flat
+directory of files `ingest`'s source glob assumes by default. Point
+`raw_log_dir` at the projects directory and turn on recursive
+traversal:
+
+```json
+{
+  "raw_log_dir": "~/.claude/projects",
+  "ingest_format": "claude_code",
+  "raw_log_recursive": true
+}
+```
+
+If the sessions being ingested live under a fixed root of dated,
+timestamped unit directories (`<root>/YYYY-MM-DD_HHMMSS/`) -- as they
+do for [claude-workspaces](https://github.com/rengotaku/claude-workspaces)
+-- set `cw_units_dir` to that root and every converted row is stamped
+with the unit it came from (the `unit` field, recovered from the
+project-key directory name Claude Code derives from the session's
+working directory):
+
+```json
+{ "cw_units_dir": "~/claude-workspaces/units" }
+```
+
+**Ingestion staleness.** Claude Code deletes session transcripts after
+`cleanupPeriodDays` (30 by default), so anything that stops the daemon
+from converting them loses whatever it hadn't converted yet, for good,
+once that window passes. That isn't only the daemon process dying --
+just as easily, `raw_log_dir` becomes a typo'd path, an unmounted drive,
+or loses read permission while the daemon keeps running and completing
+every scheduled run "successfully", converting zero rows each time
+because it can't find anything there. That failure mode looks
+identical to a perfectly healthy quiet day unless something checks for
+it specifically. So every run records two things, not one: whether the
+process executed at all, and -- separately -- whether `raw_log_dir`
+actually resolved to any source file. Check both from outside the
+process (a cron job, a monitoring script) with:
+
+```bash
+python -m lossless_memory.ingest --check-stale
+```
+
+This exits `0` only if both are healthy within `stale_after_hours` (24
+by default, configurable in `config.json`), and `1` (with a status line
+for each) if either the process hasn't run recently, or `raw_log_dir`
+hasn't resolved to any source file recently -- even if the process
+itself has kept running the whole time.
+
+---
+
 ## Numbers from real operation
 
 These are measurements from the running instance, not projections.
