@@ -1,0 +1,24 @@
+#!/bin/sh
+# cw-memory: search the lossless log from a shell (and from `cw memory`).
+#
+# Injects the venv and the config file used by the systemd units, then runs
+# `python -m lossless_memory.recall` with the arguments as given. Override the
+# locations with CW_MEMORY_VENV / LM_CONFIG_PATH.
+#
+#   cw-memory "きのう 設計"
+#   cw-memory "2026-09-22 段取り7" --all-time
+#   cw-memory "上限" --type=topic-removed
+VENV="${CW_MEMORY_VENV:-$HOME/.local/share/cw-memory/venv}"
+LM_CONFIG_PATH="${LM_CONFIG_PATH:-$HOME/.config/cw-memory/config.json}"
+export LM_CONFIG_PATH
+
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "cw-memory: venv が見つかりません ($VENV)。README の「cw での常駐」節の手順 1 を参照" >&2
+  exit 127
+fi
+if [ ! -f "$LM_CONFIG_PATH" ]; then
+  echo "cw-memory: 設定ファイルが見つかりません ($LM_CONFIG_PATH)。README の「cw での常駐」節の手順 2 を参照" >&2
+  exit 1
+fi
+
+exec "$VENV/bin/python" -m lossless_memory.recall "$@"
