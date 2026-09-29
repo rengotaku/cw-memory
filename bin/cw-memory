@@ -7,7 +7,6 @@
 #
 #   cw-memory "きのう 設計"
 #   cw-memory "2026-09-22 段取り7" --all-time
-#   cw-memory "上限" --type=topic-removed
 VENV="${CW_MEMORY_VENV:-$HOME/.local/share/cw-memory/venv}"
 LM_CONFIG_PATH="${LM_CONFIG_PATH:-$HOME/.config/cw-memory/config.json}"
 export LM_CONFIG_PATH

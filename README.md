@@ -215,7 +215,6 @@ itself has kept running the whole time.
    ```bash
    ln -s <リポジトリのパス>/bin/cw-memory ~/.local/bin/cw-memory
    cw-memory "きのう 設計"          # 語と時間表現で検索
-   cw-memory "上限" --type=topic-removed
    ```
    `bin/cw-memory` は venv と `LM_CONFIG_PATH`（既定は上の設定ファイル）を注入して `lossless_memory.recall` を呼ぶ。場所は `CW_MEMORY_VENV` / `LM_CONFIG_PATH` で変えられる。`cw memory ...` からも同じものが呼ばれる。
 
