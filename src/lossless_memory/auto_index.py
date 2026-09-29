@@ -62,6 +62,8 @@ def run(fmt=None, force=False, quiet=True):
 
     changed, sig = _changed(src_dir, recursive=recursive)
     if not changed and not force:
+        source_count = len(ingest.list_source_files(src_dir, recursive=recursive)) if src_dir else 0
+        ingest._record_heartbeat(0, source_count)
         return False, "index: no change (skipped)"
 
     if force:

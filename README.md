@@ -176,8 +176,12 @@ itself has kept running the whole time.
    ~/.local/share/cw-memory/venv/bin/pip install --no-deps -e <リポジトリのパス>
    ```
    （`--no-deps` で意味検索の依存を入れない。入れたくなったら後から `pip install sqlite-vec sentence-transformers`）
+   意味検索の依存を後から入れたら `python -m lossless_memory.auto_index --force` で索引を作り直す。
 
 2. **設定ファイル `~/.config/cw-memory/config.json` の例**
+   ```bash
+   mkdir -p "$HOME/.config/cw-memory" "$HOME/.local/share/cw-memory/data"
+   ```
    ```json
    {
      "raw_log_dir": "~/.claude/projects",
@@ -204,7 +208,8 @@ itself has kept running the whole time.
 4. **状態確認**
    - サービス状態: `systemctl --user status cw-memory-ingest`
    - ログ確認: `journalctl --user -u cw-memory-ingest`
-   - 取り込み停止検知の単体実行: `<venv>/bin/python -m lossless_memory.ingest --check-stale`
+   - 取り込み停止検知の単体実行: `LM_CONFIG_PATH="$HOME/.config/cw-memory/config.json" "$HOME/.local/share/cw-memory/venv/bin/python" -m lossless_memory.ingest --check-stale`
+   - 通知の疎通確認: `systemctl --user start cw-memory-stale-check.service` を一度実行して通知が出ること（出ない環境では journal にだけ残る）
 
 停止や再起動:
 ```bash
