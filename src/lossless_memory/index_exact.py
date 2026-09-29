@@ -621,19 +621,26 @@ def build_index(force=False):
         con.close()
 
 
-def _type_clause(include_action):
+def _type_clause(include_action=False, types=None):
     """type != 'meta' is always excluded (compaction boundaries / harness
     noise, never a real message). type='action' (a tool call's own body)
     is excluded too unless include_action is True -- it's 61% of stored
     rows and, being high-volume/low-signal, otherwise crowds out real
-    messages both in FTS rank order and in the final row count."""
+    messages both in FTS rank order and in the final row count.
+    When types is specified, explicit specification takes precedence and
+    only those types are matched (including action/meta if specified)."""
+    if types:
+        if isinstance(types, str):
+            types = [t.strip() for t in types.split(",") if t.strip()]
+        escaped = ", ".join("'" + str(t).replace("'", "''") + "'" for t in types)
+        return f"type IN ({escaped})"
     if include_action:
         return "type != 'meta'"
     return "type != 'meta' AND type != 'action'"
 
 
-def _fetch_rows(con, match_query, actor, hard_limit, include_action=False):
-    type_clause = _type_clause(include_action)
+def _fetch_rows(con, match_query, actor, hard_limit, include_action=False, types=None):
+    type_clause = _type_clause(include_action, types=types)
     if match_query:
         sql = ("SELECT rowid, ts, actor, role, type, text, model, session"
                " FROM recall WHERE bigram MATCH ? AND " + type_clause)
@@ -670,13 +677,13 @@ def _apply_time_filters(rows, date_range, time_jst):
     return out
 
 
-def _fetch_day(con, date_range, time_jst, actor, limit, include_action=False):
+def _fetch_day(con, date_range, time_jst, actor, limit, include_action=False, types=None):
     """Date mode: return the whole day (or time-of-day window within
     it) in chronological order, for a "what did we talk about on day
     X" query -- the whole flow, not a scattering of fragments. If too
     many rows match, keep the most recent `limit` (chronological order
     is preserved). Returns (rows, omitted_count)."""
-    sql = "SELECT ts, actor, role, type, text, model, session FROM recall WHERE " + _type_clause(include_action)
+    sql = "SELECT ts, actor, role, type, text, model, session FROM recall WHERE " + _type_clause(include_action, types=types)
     params = []
     if actor:
         sql += " AND actor = ?"
@@ -691,7 +698,7 @@ def _fetch_day(con, date_range, time_jst, actor, limit, include_action=False):
     return rows, omitted
 
 
-def search(keyword, actor=None, limit=5, include_action=False):
+def search(keyword, actor=None, limit=5, include_action=False, types=None):
     """Search by keyword and/or date and/or time-of-day, newest first.
     All three are optional and combine freely -- with nothing at all
     it just returns the most recent rows. Returns a list of raw-row
@@ -747,7 +754,7 @@ def search(keyword, actor=None, limit=5, include_action=False):
         hard_limit = int(limit) * 8 + 20
 
         def _run(match_query):
-            rows = _fetch_rows(con, match_query, actor, hard_limit, include_action=include_action)
+            rows = _fetch_rows(con, match_query, actor, hard_limit, include_action=include_action, types=types)
             rows = _apply_time_filters(rows, date_range, time_jst)
             rows.sort(key=lambda r: _is_negative(r.get("text", "")))  # negatives last (stable sort)
             for r in rows:
@@ -782,7 +789,7 @@ def search(keyword, actor=None, limit=5, include_action=False):
         con.close()
 
 
-def raw_hit_count(keyword, actor=None, include_action=True):
+def raw_hit_count(keyword, actor=None, include_action=True, types=None):
     """Diagnostic-only: how many rows match this query by the same
     tiered strategy search() uses (phrase, then AND-of-keywords, then
     OR-of-every-bigram -- see search()'s docstring), ignoring date/time
@@ -815,7 +822,7 @@ def raw_hit_count(keyword, actor=None, include_action=True):
             def _count(match_query):
                 if not match_query:
                     return 0
-                sql = "SELECT count(*) FROM recall WHERE bigram MATCH ? AND " + _type_clause(include_action)
+                sql = "SELECT count(*) FROM recall WHERE bigram MATCH ? AND " + _type_clause(include_action, types=types)
                 params = [match_query]
                 if actor:
                     sql += " AND actor = ?"
@@ -845,7 +852,7 @@ AROUND_MAX_N = 20        # clamp on the N in --around=N itself
 AROUND_ROW_CAP = 120     # clamp on the total row count a context pull returns
 
 
-def search_with_context(keyword, actor=None, hits=2, around=1, day_limit=40, include_action=False):
+def search_with_context(keyword, actor=None, hits=2, around=1, day_limit=40, include_action=False, types=None):
     """Like search(), but also returns `around` rows before and after
     each hit, from the same session, in chronological order with no
     duplicates. Returns (rows, omitted_count) -- omitted_count is the
@@ -865,12 +872,12 @@ def search_with_context(keyword, actor=None, hits=2, around=1, day_limit=40, inc
         # July 4th") means "show me the whole day", not "find a
         # fragment" -- use _fetch_day instead of a hit + context pull.
         if date_range is not None and not keywords:
-            return _fetch_day(con, date_range, time_jst, actor, day_limit, include_action=include_action)
+            return _fetch_day(con, date_range, time_jst, actor, day_limit, include_action=include_action, types=types)
 
         hard_limit = int(hits) * 8 + 20
 
         def _candidates(match_query):
-            rows = _fetch_rows(con, match_query, actor, hard_limit, include_action=include_action)
+            rows = _fetch_rows(con, match_query, actor, hard_limit, include_action=include_action, types=types)
             rows = _apply_time_filters(rows, date_range, time_jst)
             return rows
 
@@ -1016,7 +1023,7 @@ DATE_SCOPE_ROW_CAP = 60
 
 def search_time(date_range, time_jst, keywords, actor=None,
                 hits=8, around=0, day_limit=40, include_action=False,
-                row_cap=DATE_SCOPE_ROW_CAP):
+                row_cap=DATE_SCOPE_ROW_CAP, types=None):
     """The formal entry point for time-scoped search: takes an
     already-parsed (date_range, time_jst, keywords) -- typically from
     _split_time_query -- and returns only what's inside that range.
@@ -1033,7 +1040,7 @@ def search_time(date_range, time_jst, keywords, actor=None,
     omitted (how many in-range rows were dropped by row_cap -- the
     oldest ones, always counted, never silently truncated).
 
-    type='action' rows are excluded unless include_action=True."""
+    type='action' rows are excluded unless include_action=True (or types specified)."""
     around = max(0, min(int(around), AROUND_MAX_N))
     fallback_day = None
     if date_range is None and time_jst is not None:
@@ -1054,10 +1061,17 @@ def search_time(date_range, time_jst, keywords, actor=None,
         # the log grew large.
         _lo = (date_range[0] - timedelta(seconds=1)).isoformat()
         _hi = (date_range[1] + timedelta(seconds=1)).isoformat()
-        _type_extra = "" if include_action else " AND type != 'action'"
+        if types:
+            if isinstance(types, str):
+                types = [t.strip() for t in types.split(",") if t.strip()]
+            escaped = ", ".join("'" + str(t).replace("'", "''") + "'" for t in types)
+            _type_filter = f" AND type IN ({escaped})"
+        else:
+            _type_extra = "" if include_action else " AND type != 'action'"
+            _type_filter = " AND type != 'meta' AND type != 'doc'" + _type_extra
         _sql = ("SELECT rowid, ts, actor, role, type, text, model, session"
-                " FROM recall WHERE ts >= ? AND ts <= ? AND type != 'meta' AND type != 'doc'"
-                + _type_extra)
+                " FROM recall WHERE ts >= ? AND ts <= ?"
+                + _type_filter)
         _params = [_lo, _hi]
         if actor:
             _sql += " AND actor = ?"

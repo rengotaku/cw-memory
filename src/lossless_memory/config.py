@@ -39,6 +39,10 @@ _DEFAULTS = {
     # name, and stamps every converted row with a "unit" field. None
     # disables unit recovery (every row's "unit" field is null).
     "cw_units_dir": None,
+    # root directory cw topics live under (e.g. "~/claude-workspaces/topics").
+    # When set, topic_archive.py converts <cw_topics_dir>/*/archive.jsonl
+    # into corpus/topic-archive/<topic>.jsonl. None disables topic archives.
+    "cw_topics_dir": None,
     # how many hours ingest is allowed to go without a successful run
     # before --check-stale reports it as stopped
     "stale_after_hours": 24,
