@@ -1,0 +1,9 @@
+[Unit]
+Description=cw-memory ingestion staleness check
+Documentation=https://github.com/rengotaku/claude-workspaces/issues/116
+
+[Service]
+Type=oneshot
+Environment=LM_CONFIG_PATH=%h/.config/cw-memory/config.json
+WorkingDirectory=%h/.local/share/cw-memory
+ExecStart=/bin/sh -c '%h/.local/share/cw-memory/venv/bin/python -m lossless_memory.ingest --check-stale || { notify-send "cw-memory" "会話ログの取り込みが止まっています（journalctl --user -u cw-memory-ingest）"; exit 1; }'

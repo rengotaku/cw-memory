@@ -1,0 +1,10 @@
+[Unit]
+Description=cw-memory periodic ingestion staleness check timer
+Documentation=https://github.com/rengotaku/claude-workspaces/issues/116
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

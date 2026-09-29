@@ -14,7 +14,10 @@ import os
 from .config import config, data_dir
 from . import ingest
 from . import index_exact
-from . import index_vector
+# index_vector pulls in sqlite-vec / sentence-transformers, which is heavy
+# and not needed for exact-only use -- imported lazily in run() below
+# so indexing still works (exact index only) in an environment that never
+# installed them.
 
 
 def _stamp_path():
@@ -67,7 +70,12 @@ def run(fmt=None, force=False, quiet=True):
         total, _full, skipped = ingest.convert_incremental(fmt=fmt, source=src_dir, recursive=recursive)
 
     n_exact = index_exact.build_index()
-    n_vec = index_vector.build_index(progress=not quiet)
+    try:
+        from . import index_vector
+        n_vec = index_vector.build_index(progress=not quiet)
+    except ImportError as ex:
+        print(f"vector index skipped: {ex}", flush=True)
+        n_vec = 0
 
     os.makedirs(os.path.dirname(_stamp_path()), exist_ok=True)
     with open(_stamp_path(), "w", encoding="utf-8") as f:
