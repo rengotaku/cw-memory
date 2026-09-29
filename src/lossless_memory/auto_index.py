@@ -63,7 +63,10 @@ def _changed(src_dir, recursive=False):
 def run(fmt=None, force=False, quiet=True):
     """Run the full pipeline if the source logs changed (or force=True).
     Returns (updated: bool, message: str)."""
-    topic_archive.sync()
+    try:
+        topic_archive.sync()
+    except Exception as ex:
+        print(f"topic archive sync failed: {ex}", flush=True)
 
     cfg = config()
     fmt = fmt or cfg.get("ingest_format") or "plain"

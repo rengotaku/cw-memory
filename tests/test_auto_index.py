@@ -323,3 +323,58 @@ def test_auto_index_zero_sources_does_not_update_last_sources_found_at(tmp_path,
     assert ingest.last_sources_found_count() == 1
 
 
+def test_auto_index_topic_archive_sync_failure_resilient(tmp_path, monkeypatch, capsys):
+    """sync が OSError を投げるよう monkeypatch した状態で auto_index.run(force=True) を呼ぶと、
+    例外を投げずに終わり、transcript の本文が index_exact の検索で返り、ログに "topic archive sync failed" が出ることを検証。
+    """
+    monkeypatch.setitem(sys.modules, "lossless_memory.index_vector", None)
+    monkeypatch.delitem(sys.modules, "lossless_memory.auto_index", raising=False)
+    monkeypatch.delitem(sys.modules, "lossless_memory.daemon", raising=False)
+
+    data_dir_path = tmp_path / "data"
+    raw_dir_path = tmp_path / "raw"
+    data_dir_path.mkdir()
+    raw_dir_path.mkdir()
+
+    proj_dir = raw_dir_path / "test-proj"
+    proj_dir.mkdir()
+    session_id = "22222222-2222-2222-2222-222222222222"
+    target_text = "resilient transcript indexing test target text"
+    line = _claude_line("2026-09-29T10:00:00Z", "user", target_text, session_id)
+    (proj_dir / f"{session_id}.jsonl").write_text(line + "\n", encoding="utf-8")
+
+    config_file = tmp_path / "config.json"
+    cfg = {
+        "data_dir": str(data_dir_path),
+        "raw_log_dir": str(raw_dir_path),
+        "ingest_format": "claude_code",
+        "raw_log_recursive": True,
+    }
+    config_file.write_text(json.dumps(cfg), encoding="utf-8")
+    monkeypatch.setenv("LM_CONFIG_PATH", str(config_file))
+    monkeypatch.chdir(tmp_path)
+
+    from lossless_memory.config import config
+    config(force_reload=True)
+
+    import lossless_memory.auto_index as auto_index
+    import lossless_memory.index_exact as index_exact
+    import lossless_memory.topic_archive as topic_archive
+
+    def _mock_sync():
+        raise OSError("simulated disk error during topic archive sync")
+
+    monkeypatch.setattr(topic_archive, "sync", _mock_sync)
+
+    updated, msg = auto_index.run(force=True)
+    assert updated is True
+
+    hits = index_exact.search(target_text)
+    assert len(hits) >= 1
+    assert any(target_text in h["text"] for h in hits)
+
+    captured = capsys.readouterr()
+    assert "topic archive sync failed" in captured.out
+    assert "simulated disk error during topic archive sync" in captured.out
+
+
