@@ -165,7 +165,7 @@ def _vector_search(query, limit):
 
 
 def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exact_only=False,
-          include_action=False):
+          include_action=False, types=None, **kwargs):
     """The shared core of recall. Returns a deduped list of raw-row
     dicts. Not meant to be called directly by most users -- see
     recall() below, which formats the result for display.
@@ -176,7 +176,18 @@ def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exa
     hits within a LIMIT); this function re-applies it defensively to
     every source (including index_vector, which this module doesn't
     own and can't guarantee filters the same way) so the contract holds
-    regardless of where a row came from."""
+    regardless of where a row came from.
+    When types is specified, only rows whose type is in types are returned
+    (action/meta are not excluded if specified)."""
+    if types is None and "type" in kwargs:
+        types = kwargs["type"]
+    if isinstance(types, str):
+        types = [t.strip() for t in types.split(",") if t.strip()]
+    elif types is not None:
+        types = [str(t).strip() for t in types if str(t).strip()]
+    if not types:
+        types = None
+
     del LAST_ERRORS[:]
     del LAST_MODE[:]
     del LAST_TIME_TOTAL[:]
@@ -197,7 +208,7 @@ def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exa
                 _hits = max(log_limit, 8) if _kws else 2
                 ses_hits, _meta = index_exact.search_time(
                     _dr, _tr, _kws, actor=actor, hits=_hits, around=int(around),
-                    include_action=include_action)
+                    include_action=include_action, types=types)
                 ses_hits = list(ses_hits or [])
                 LAST_MODE.append("time")
                 LAST_TIME_TOTAL.append(int(_meta.get("total", 0)))
@@ -209,6 +220,8 @@ def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exa
                 if len(ses_hits) < 2 and not exact_only:
                     _vec_l3 = _vector_search(query, max(log_limit, 8))
                     if _vec_l3:
+                        if types:
+                            _vec_l3 = [r for r in _vec_l3 if (r.get("type") or "text") in set(types)]
                         ses_hits = _dedupe_rows(list(ses_hits) + _vec_l3)
                         LAST_MODE.append("L3")
             except Exception as ex:
@@ -219,29 +232,38 @@ def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exa
                 if around:
                     _ctx, _ctx_omitted = index_exact.search_with_context(
                         query, actor=actor, hits=max(log_limit, 4), around=int(around),
-                        include_action=include_action)
+                        include_action=include_action, types=types)
                     ses_hits = list(_ctx or [])
                     LAST_OMITTED.append(int(_ctx_omitted or 0))
                 else:
                     ses_hits = list(index_exact.search(
-                        query, actor, limit=max(log_limit, 8), include_action=include_action) or [])
+                        query, actor, limit=max(log_limit, 8), include_action=include_action, types=types) or [])
             except Exception as ex:
                 _note_error("index_exact", ex)
             if not actor and not exact_only:
                 vec_hits = _vector_search(query, max(log_limit, 8))
+                if types:
+                    vec_hits = [r for r in vec_hits if (r.get("type") or "text") in set(types)]
                 _ds0 = [r.get("distance") for r in vec_hits if r.get("distance") is not None]
                 if (not _ds0) or min(_ds0) > VEC_FAR_CUT_NORMAL:
                     for q in _expand_query(query):
                         try:
                             ses_hits += list(index_exact.search(
-                                q, actor, limit=max(log_limit, 8), include_action=include_action) or [])
+                                q, actor, limit=max(log_limit, 8), include_action=include_action, types=types) or [])
                         except Exception as ex:
                             _note_error("index_exact", ex)
-                        vec_hits += _vector_search(q, max(log_limit, 8))
+                        _v = _vector_search(q, max(log_limit, 8))
+                        if types:
+                            _v = [r for r in _v if (r.get("type") or "text") in set(types)]
+                        vec_hits += _v
     finally:
         sys.stdout = real
 
-    if not include_action:
+    if types:
+        target_types = set(types)
+        ses_hits = [r for r in ses_hits if (r.get("type") or "text") in target_types]
+        vec_hits = [r for r in vec_hits if (r.get("type") or "text") in target_types]
+    elif not include_action:
         ses_hits = [r for r in ses_hits if (r.get("type") or "text") != "action"]
         vec_hits = [r for r in vec_hits if (r.get("type") or "text") != "action"]
 
@@ -251,7 +273,7 @@ def fetch(query, log_limit=4, recency=True, tail=True, actor=None, around=0, exa
         uniq = _dedupe_rows(ses_hits)[: log_limit * 2]
     else:
         uniq = _fuse(ses_hits, vec_hits, log_limit * 2, recency=recency, _fuse_query=query)
-    if tail and not _time_mode and not actor:
+    if tail and not _time_mode and not actor and (types is None or "text" in types):
         exclude = {((r.get("ts") or "")[:16], (r.get("text") or "")[:40]) for r in uniq}
         _tail_search(query, exclude)
     return uniq
@@ -538,7 +560,7 @@ def _detect_session():
     return None
 
 
-def _compact_lines(session, n, include_action=False):
+def _compact_lines(session, n, include_action=False, types=None):
     lines = []
     if _qr is None:
         lines.append("query_rules is unavailable, so compaction boundaries can't be read.")
@@ -568,7 +590,9 @@ def _compact_lines(session, n, include_action=False):
         # boundary" pull -- search_time's own row cap (see
         # DATE_SCOPE_ROW_CAP) now applies here too, since this is the
         # same date-scoped-with-no-keywords path (#106 point 1).
-        rows, _meta = index_exact.search_time((s_dt, e_dt), None, [], include_action=include_action)
+        rows, _meta = index_exact.search_time((s_dt, e_dt), None, [], include_action=include_action, types=types)
+        if types:
+            rows = [r for r in rows if (r.get("type") or "text") in set(types)]
         omitted = int(_meta.get("omitted", 0))
     except Exception as ex:
         _note_error("compact(search_time)", ex)
@@ -595,15 +619,29 @@ FULL_CHAR_CAP = 4000
 
 
 def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
-          compact_n=0, session=None, include_action=False):
+          compact_n=0, session=None, include_action=False, types=None, **kwargs):
     """The manual entry point. Calls fetch() and formats the result
     for display. Returns a list of display lines, [NOW] first."""
+    if types is None and "type" in kwargs:
+        types = kwargs["type"]
+    if types is None and "--type=" in query:
+        m = re.search(r"--type=([^\s]+)", query)
+        if m:
+            types = [t.strip() for t in m.group(1).split(",") if t.strip()]
+            query = (query[:m.start()] + query[m.end():]).strip()
+    if isinstance(types, str):
+        types = [t.strip() for t in types.split(",") if t.strip()]
+    elif types is not None:
+        types = [str(t).strip() for t in types if str(t).strip()]
+    if not types:
+        types = None
+
     del LAST_MODE[:]
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = ["[NOW] " + now + " -- anchor on the current time before reading anything below."]
 
     if compact_n:
-        lines.extend(_compact_lines(session, compact_n, include_action=include_action))
+        lines.extend(_compact_lines(session, compact_n, include_action=include_action, types=types))
         return lines
 
     _dr, _tr, _kws = _split_time(query)
@@ -612,7 +650,7 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
                      "Add a date to narrow it (e.g. \"2026-09-02 evening budget\").")
 
     uniq = fetch(query, actor=actor, around=around, log_limit=limit, recency=recency,
-                include_action=include_action)
+                include_action=include_action, types=types)
     if "exact-only" in LAST_MODE:
         lines.append("Semantic search is unavailable right now; showing exact date/keyword matches only.")
 
@@ -646,9 +684,9 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
 
         if "time" in LAST_MODE:
             meta0 = LAST_TIME_META[0] if LAST_TIME_META else {}
-            types = meta0.get("types") or {}
+            _types_dict = meta0.get("types") or {}
             _label = {"text": "message", "action": "action", "thinking": "thinking", "meta": "meta"}
-            _type_parts = ", ".join("%s %d" % (_label.get(k, k), v) for k, v in types.items())
+            _type_parts = ", ".join("%s %d" % (_label.get(k, k), v) for k, v in _types_dict.items())
             _head = "-- date-scoped: %d row(s), ~%d chars%s (chronological)" % (len(ordered), total_chars, cut_note)
             if _type_parts:
                 _head += " -- " + _type_parts
@@ -734,7 +772,7 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
         # "checked, found nothing" are different claims and must read
         # differently here.
         try:
-            _idx_all = index_exact.raw_hit_count(query, actor=actor, include_action=True)
+            _idx_all = index_exact.raw_hit_count(query, actor=actor, include_action=True, types=types)
         except Exception:
             _idx_all = None
         if _idx_all is None:
@@ -747,7 +785,7 @@ def recall(query, limit=6, recency=True, actor=None, around=0, full=False,
                              "for this text -- try --around or different wording." % _idx_all)
             else:
                 try:
-                    _idx_visible = index_exact.raw_hit_count(query, actor=actor, include_action=False)
+                    _idx_visible = index_exact.raw_hit_count(query, actor=actor, include_action=False, types=types)
                 except Exception:
                     _idx_visible = None
                 if _idx_visible == 0:
@@ -774,7 +812,21 @@ def main():
     except Exception:
         pass
     argv = sys.argv[1:]
-    args = [a for a in argv if not a.startswith("--")]
+    types = None
+    type_arg_indices = set()
+    for i, a in enumerate(argv):
+        if a.startswith("--type="):
+            parts = [t.strip() for t in a.split("=", 1)[1].split(",") if t.strip()]
+            if types is None:
+                types = []
+            types.extend(parts)
+        elif a == "--type" and i + 1 < len(argv):
+            parts = [t.strip() for t in argv[i + 1].split(",") if t.strip()]
+            if types is None:
+                types = []
+            types.extend(parts)
+            type_arg_indices.add(i + 1)
+    args = [a for i, a in enumerate(argv) if not a.startswith("--") and i not in type_arg_indices]
     actor = None
     if "--user" in argv:
         actor = ACTOR_USER
@@ -810,11 +862,11 @@ def main():
             session = a.split("=", 1)[1]
 
     if compact_n:
-        for line in recall("", compact_n=compact_n, session=session, include_action=include_action):
+        for line in recall("", compact_n=compact_n, session=session, include_action=include_action, types=types):
             print(line)
         return
 
-    if not args or not args[0].strip():
+    if "--help" in argv or "-h" in argv or not args or not args[0].strip():
         print('usage: python -m lossless_memory.recall "query" [options]')
         print("The one entry point for pulling memory back out; don't call index_exact / index_vector directly.")
         print("")
@@ -830,17 +882,19 @@ def main():
         print("--user        = only rows from the configured user_name")
         print("--ai          = only rows from the configured ai_name")
         print("--action      = include type=action rows (tool-call bodies; excluded by default)")
+        print("--type=TYPES  = only rows matching given comma-separated type(s) (e.g. topic-removed,topic-decision)")
         print("--all-time    = no recency decay (weigh old and new equally)")
         print("--full        = don't truncate rows to %d chars (still capped at %d, not unbounded)"
               % (DEFAULT_CHAR_CAP, FULL_CHAR_CAP))
         print("--compact[=N] = everything since the N-th-to-last compaction boundary (claude_code format only,")
         print("                row count capped like a date-scoped query; a drop is always noted)")
         print("--session=ID  = session id to use with --compact (default: auto-detected)")
-        sys.exit(1)
+        sys.exit(0 if ("--help" in argv or "-h" in argv) else 1)
 
     query = " ".join(args)
     lines = recall(query, recency=("--all-time" not in sys.argv),
-                   actor=actor, around=around, full=full, include_action=include_action)
+                   actor=actor, around=around, full=full, include_action=include_action,
+                   types=types)
     for line in lines:
         print(line)
 

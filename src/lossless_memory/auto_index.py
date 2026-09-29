@@ -10,10 +10,12 @@ files' mtimes lets it skip the (comparatively expensive) vector
 embedding step entirely when nothing changed.
 """
 import os
+import glob
 
 from .config import config, data_dir
 from . import ingest
 from . import index_exact
+from . import topic_archive
 # index_vector pulls in sqlite-vec / sentence-transformers, which is heavy
 # and not needed for exact-only use -- imported lazily in run() below
 # so indexing still works (exact index only) in an environment that never
@@ -25,17 +27,25 @@ def _stamp_path():
 
 
 def _logs_signature(src_dir, recursive=False):
-    """Sum of the source files' mtimes -- a cheap fingerprint of
+    """Sum of the source files' and topic-archive files' mtimes -- a cheap fingerprint of
     "has anything changed"."""
     total = 0.0
-    if not src_dir:
+    if src_dir:
+        for fp in ingest.list_source_files(src_dir, recursive=recursive):
+            try:
+                total += os.path.getmtime(fp)
+            except OSError:
+                pass
+    archive_dir = os.path.join(data_dir(), "corpus", "topic-archive")
+    if os.path.isdir(archive_dir):
+        for fp in sorted(glob.glob(os.path.join(archive_dir, "*.jsonl"))):
+            try:
+                total += os.path.getmtime(fp)
+            except OSError:
+                pass
+    if total == 0.0:
         return "0"
-    for fp in ingest.list_source_files(src_dir, recursive=recursive):
-        try:
-            total += os.path.getmtime(fp)
-        except OSError:
-            pass
-    return f"{total:.0f}"
+    return f"{total:.4f}"
 
 
 def _changed(src_dir, recursive=False):
@@ -53,6 +63,11 @@ def _changed(src_dir, recursive=False):
 def run(fmt=None, force=False, quiet=True):
     """Run the full pipeline if the source logs changed (or force=True).
     Returns (updated: bool, message: str)."""
+    try:
+        topic_archive.sync()
+    except Exception as ex:
+        print(f"topic archive sync failed: {ex}", flush=True)
+
     cfg = config()
     fmt = fmt or cfg.get("ingest_format") or "plain"
     src_dir = cfg.get("raw_log_dir")
