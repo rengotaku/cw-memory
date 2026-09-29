@@ -211,6 +211,15 @@ itself has kept running the whole time.
    - 取り込み停止検知の単体実行: `LM_CONFIG_PATH="$HOME/.config/cw-memory/config.json" "$HOME/.local/share/cw-memory/venv/bin/python" -m lossless_memory.ingest --check-stale`
    - 通知の疎通確認: `systemctl --user start cw-memory-stale-check.service` を一度実行して通知が出ること（出ない環境では journal にだけ残る）
 
+5. **検索コマンドを PATH に置く**
+   ```bash
+   ln -s <リポジトリのパス>/bin/cw-memory ~/.local/bin/cw-memory
+   cw-memory "きのう 設計"          # 語と時間表現で検索
+   ```
+   `bin/cw-memory` は venv と `LM_CONFIG_PATH`（既定は上の設定ファイル）を注入して `lossless_memory.recall` を呼ぶ。場所は `CW_MEMORY_VENV` / `LM_CONFIG_PATH` で変えられる。`cw memory ...` からも同じものが呼ばれる。
+
+   Claude Code のサンドボックス内から呼ぶときは、データディレクトリ（`~/.local/share/cw-memory/data`）をサンドボックスの書き込み許可に入れる。SQLite の WAL は読み取りだけでもデータディレクトリに `-shm` ファイルを作るので、書けないと `unable to open database file` で検索が失敗する。
+
 停止や再起動:
 ```bash
 # 停止
