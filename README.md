@@ -164,6 +164,64 @@ itself has kept running the whole time.
 
 ---
 
+## cw での常駐（systemd user unit）
+
+会話ログの取り込み daemon を systemd の user unit として常駐させ、定期的な取り込み停止検知を行います。
+
+### 手順
+
+1. **venv の作成**
+   ```bash
+   python3 -m venv ~/.local/share/cw-memory/venv
+   ~/.local/share/cw-memory/venv/bin/pip install --no-deps -e <リポジトリのパス>
+   ```
+   （`--no-deps` で意味検索の依存を入れない。入れたくなったら後から `pip install sqlite-vec sentence-transformers`）
+   意味検索の依存を後から入れたら `python -m lossless_memory.auto_index --force` で索引を作り直す。
+
+2. **設定ファイル `~/.config/cw-memory/config.json` の例**
+   ```bash
+   mkdir -p "$HOME/.config/cw-memory" "$HOME/.local/share/cw-memory/data"
+   ```
+   ```json
+   {
+     "raw_log_dir": "~/.claude/projects",
+     "ingest_format": "claude_code",
+     "raw_log_recursive": true,
+     "cw_units_dir": "~/claude-workspaces/units",
+     "data_dir": "/home/<user>/.local/share/cw-memory/data"
+   }
+   ```
+   - `raw_log_dir` は Claude Code の transcript 置き場（`~/.claude/projects`）
+   - `ingest_format=claude_code`
+   - `raw_log_recursive=true`
+   - `cw_units_dir=~/claude-workspaces/units`
+   - `data_dir` は絶対パス（`~` は展開されない）で `/home/<user>/.local/share/cw-memory/data`
+
+3. **unit のコピーと有効化・起動**
+   ```bash
+   mkdir -p ~/.config/systemd/user
+   cp systemd/user/cw-memory-ingest.service systemd/user/cw-memory-stale-check.service systemd/user/cw-memory-stale-check.timer ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now cw-memory-ingest.service cw-memory-stale-check.timer
+   ```
+
+4. **状態確認**
+   - サービス状態: `systemctl --user status cw-memory-ingest`
+   - ログ確認: `journalctl --user -u cw-memory-ingest`
+   - 取り込み停止検知の単体実行: `LM_CONFIG_PATH="$HOME/.config/cw-memory/config.json" "$HOME/.local/share/cw-memory/venv/bin/python" -m lossless_memory.ingest --check-stale`
+   - 通知の疎通確認: `systemctl --user start cw-memory-stale-check.service` を一度実行して通知が出ること（出ない環境では journal にだけ残る）
+
+停止や再起動:
+```bash
+# 停止
+systemctl --user stop cw-memory-ingest.service cw-memory-stale-check.timer
+
+# 再起動
+systemctl --user restart cw-memory-ingest.service
+```
+
+---
+
 ## Numbers from real operation
 
 These are measurements from the running instance, not projections.

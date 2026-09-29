@@ -1,0 +1,14 @@
+[Unit]
+Description=cw-memory conversation log ingestion daemon
+Documentation=https://github.com/rengotaku/claude-workspaces/issues/116
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/cw-memory/venv/bin/python -m lossless_memory.daemon
+Environment=LM_CONFIG_PATH=%h/.config/cw-memory/config.json
+WorkingDirectory=%h/.local/share/cw-memory
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
