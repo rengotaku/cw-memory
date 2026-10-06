@@ -234,6 +234,50 @@ systemctl --user stop cw-memory-ingest.service cw-memory-stale-check.timer
 systemctl --user restart cw-memory-ingest.service
 ```
 
+
+---
+
+## cw での常駐（launchd / macOS）
+
+macOS では systemd の代わりに launchd の LaunchAgent で常駐させる。venv・設定ファイル・検索コマンドは systemd の節の手順 1・2・5 と同じ（`data_dir` は `/Users/<user>/.local/share/cw-memory/data`）。
+
+**表1: systemd の unit と launchd の plist の対応**
+
+| systemd | launchd（`launchd/`） |
+|---|---|
+| `cw-memory-ingest.service` | `com.user.cw-memory-ingest.plist`（`KeepAlive` で常駐） |
+| `cw-memory-stale-check.service` + `.timer`（hourly） | `com.user.cw-memory-stale-check.plist`（`StartInterval` 3600 秒。失敗時は通知センターに出す） |
+
+### 手順
+
+launchd は `~` を展開しないので、plist の `@HOME@` を置き換えてから置く。
+
+```bash
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs/cw-memory
+for n in cw-memory-ingest cw-memory-stale-check; do
+  sed "s|@HOME@|$HOME|g" launchd/com.user.$n.plist > ~/Library/LaunchAgents/com.user.$n.plist
+  plutil -lint ~/Library/LaunchAgents/com.user.$n.plist
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.$n.plist
+done
+```
+
+状態確認:
+
+- 登録と直近の終了コード: `launchctl print gui/$(id -u)/com.user.cw-memory-ingest | grep -E 'state|last exit'`
+- ログ: `~/Library/Logs/cw-memory/ingest.log` / `stale-check.log`
+- 停止検知の単体実行: `launchctl kickstart gui/$(id -u)/com.user.cw-memory-stale-check`
+
+再起動と停止:
+
+```bash
+# 再起動（コードを更新したあと）
+launchctl kickstart -k gui/$(id -u)/com.user.cw-memory-ingest
+
+# 停止と登録解除
+launchctl bootout gui/$(id -u)/com.user.cw-memory-ingest
+launchctl bootout gui/$(id -u)/com.user.cw-memory-stale-check
+```
+
 ---
 
 ## Numbers from real operation

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 取り込み停止検知（systemd/user/cw-memory-stale-check.{service,timer} の macOS 版）。1 時間ごとに --check-stale を流し、
+     失敗したら通知センターに出す。@HOME@ の置き換えは ingest の plist と同じ。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.cw-memory-stale-check</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>"$HOME/.local/share/cw-memory/venv/bin/python" -m lossless_memory.ingest --check-stale || { /usr/bin/osascript -e 'display notification "会話ログの取り込みが止まっています（~/Library/Logs/cw-memory/ingest.log）" with title "cw-memory"'; exit 1; }</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LM_CONFIG_PATH</key>
+    <string>@HOME@/.config/cw-memory/config.json</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>@HOME@</string>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/cw-memory/stale-check.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/cw-memory/stale-check.log</string>
+</dict>
+</plist>
