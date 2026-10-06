@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- cw-memory の会話ログ取り込み daemon（systemd/user/cw-memory-ingest.service の macOS 版）。
+     launchd は ~ を展開しないので、@HOME@ を置き換えてから ~/Library/LaunchAgents に置く（README「cw での常駐（launchd）」）。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.cw-memory-ingest</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@HOME@/.local/share/cw-memory/venv/bin/python</string>
+    <string>-m</string>
+    <string>lossless_memory.daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LM_CONFIG_PATH</key>
+    <string>@HOME@/.config/cw-memory/config.json</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>@HOME@/.local/share/cw-memory</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/cw-memory/ingest.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/cw-memory/ingest.log</string>
+</dict>
+</plist>
