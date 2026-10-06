@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- 取り込み停止検知（systemd/user/cw-memory-stale-check.{service,timer} の macOS 版）。1 時間ごとに --check-stale を流し、
+<!-- 取り込み停止検知（systemd/user/cw-memory-stale-check.{service,timer} の macOS 版）。1 時間ごとに停止検知（ingest の check-stale オプション）を流し、
      失敗したら通知センターに出す。@HOME@ の置き換えは ingest の plist と同じ。 -->
 <plist version="1.0">
 <dict>
